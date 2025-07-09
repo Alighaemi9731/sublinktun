@@ -350,7 +350,7 @@ add_domain() {
         log_message "success" "Final Nginx reload for ${subdomain} with HTTPS."
     else
         log_message "warning" "HTTPS setup for ${subdomain} might be incomplete. Please check logs and Cloudflare DNS."
-    fi # This 'fi' was missing the '_' that was in the previous version, causing the error. Corrected.
+    fi
 
     log_message "info" "--- IMPORTANT Cloudflare Steps ---"
     log_message "info" "1. In Cloudflare, if you have an existing record for '${subdomain}', ensure it's **proxied (orange cloud)** and points to your **main server's IP**."
@@ -520,7 +520,7 @@ display_menu() {
     esac
 }
 
-# --- Self-Download and Re-execute Function ---
+# --- Self-Download and Re-execute Function (Global) ---
 self_download_and_run() {
     local script_path="/usr/local/bin/${SCRIPT_NAME}"
     
@@ -542,22 +542,30 @@ self_download_and_run() {
     log_message "success" "${SCRIPT_NAME} downloaded to ${script_path} and made executable."
     
     log_message "info" "Re-executing the script from its permanent location..."
-    exec "$script_path" # Transfer control to the newly downloaded script
+    # Use 'exec' to replace the current shell process with the newly downloaded script
+    exec "$script_path"
 }
 
 
 # --- Main Execution Flow ---
 check_root
 
-# This block determines if the script is being run for the first time via curl/wget
-# or if it's already installed locally and being run directly.
-# The `exec "$script_path"` in `self_download_and_run` transfers control to the
-# newly downloaded script, making `$(readlink -f "$0")` equal to `/usr/local/bin/${SCRIPT_NAME}`
-# for the *subsequent* run of the downloaded script.
+# Determine if this is the initial curl-based execution or a direct run of the installed script.
+# If the current script's path (resolved to its actual location) is NOT the expected installed path,
+# then it means this is the first execution (e.g., via `bash -c "$(curl ...)"`).
+CURRENT_SCRIPT_REAL_PATH="$(readlink -f "$0")"
+EXPECTED_INSTALLED_PATH="/usr/local/bin/${SCRIPT_NAME}"
 
-# Check if the script is being run as the installed version in /usr/local/bin
-if [[ "$(readlink -f "$0")" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
-    log_message "info" "Running installed script from /usr/local/bin/${SCRIPT_NAME}."
+if [[ "$CURRENT_SCRIPT_REAL_PATH" != "$EXPECTED_INSTALLED_PATH" ]]; then
+    # This is likely the first execution via curl | bash.
+    # We call the self-download function, which will then `exec` the newly downloaded script.
+    self_download_and_run
+    # The 'exec' call above means this part of the script will not be reached
+    # after a successful download and re-execution.
+else
+    # This branch is for when the script is already installed and being run directly
+    # from its permanent location (e.g., `sudo iran_vps_tunnel_manager.sh`).
+    log_message "info" "Running installed script from $EXPECTED_INSTALLED_PATH."
     load_domains || { log_message "error" "Failed to load domains. Exiting."; exit 1; }
     
     if install_dependencies; then
@@ -567,6 +575,7 @@ if [[ "$(readlink -f "$0")" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
             log_message "success" "Certbot renewal cron job added."
         fi
         
+        # Enter the main menu loop
         while true; do
             display_menu
         done
@@ -574,8 +583,4 @@ if [[ "$(readlink -f "$0")" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
         log_message "error" "Initial setup failed. Exiting."
         exit 1
     fi
-else
-    # This branch is for the *very first* execution via `curl | bash`
-    # It calls the self-downloading process.
-    self_download_and_run
 fi
