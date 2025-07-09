@@ -2,12 +2,15 @@
 
 # --- Global Variables ---
 SCRIPT_NAME="iran_vps_tunnel_manager.sh"
-GITHUB_RAW_URL="https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/YOUR_REPOSITORY_NAME/main/${SCRIPT_NAME}" # <<< IMPORTANT: Update this line
+# IMPORTANT: Update this line with your GitHub repository's raw URL for the script
+# Example: https://raw.githubusercontent.com/Alighaemi9731/sublinktun/main/iran_vps_tunnel_manager.sh
+GITHUB_RAW_URL="https://raw.githubusercontent.com/Alighaemi9731/sublinktun/main/${SCRIPT_NAME}"
 CONFIG_DIR="/etc/nginx_tunnel_manager"
 CONFIG_FILE="${CONFIG_DIR}/domains.conf"
 NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
 NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
-EMAIL_FOR_CERTBOT="your-email@example.com" # <<< IMPORTANT: Update this line
+# IMPORTANT: Update this line with your actual email for Certbot notifications
+EMAIL_FOR_CERTBOT="your-email@example.com" 
 
 # --- Text Colors ---
 RED='\033[0;31m'
@@ -18,6 +21,7 @@ NC='\033[0m' # No Color
 
 # --- Helper Functions ---
 
+# Function for standardized logging
 log_message() {
     local type="$1"
     local message="$2"
@@ -29,11 +33,13 @@ log_message() {
     esac
 }
 
+# Function to pause execution until user presses Enter
 press_enter_to_continue() {
     log_message "info" "Press Enter to continue..."
     read -r
 }
 
+# Function to ensure the script is run as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_message "error" "This script must be run as root."
@@ -46,12 +52,12 @@ install_dependencies() {
     log_message "info" "Checking for updates and installing dependencies (Nginx, Certbot)..."
     apt update -y || { log_message "error" "Failed to update package lists."; return 1; }
     apt upgrade -y || { log_message "warning" "Failed to upgrade packages, continuing..."; }
-    apt install -y nginx certbot python3-certbot-nginx || { log_message "error" "Failed to install required packages."; return 1; }
+    apt install -y nginx certbot python3-certbot-nginx || { log_message "error" "Failed to install required packages. Please check your internet connection or repository access."; return 1; }
     log_message "success" "Dependencies installed."
 
     log_message "info" "Setting up Nginx cache directory..."
-    mkdir -p /var/cache/nginx || { log_message "error" "Failed to create Nginx cache directory."; return 1; }
-    chown -R www-data:www-data /var/cache/nginx || { log_message "error" "Failed to set ownership for Nginx cache."; return 1; }
+    mkdir -p /var/cache/nginx || { log_message "error" "Failed to create Nginx cache directory. Check permissions."; return 1; }
+    chown -R www-data:www-data /var/cache/nginx || { log_message "error" "Failed to set ownership for Nginx cache. Check permissions."; return 1; }
     log_message "success" "Nginx cache directory configured."
 
     log_message "info" "Configuring main Nginx settings..."
@@ -92,15 +98,18 @@ load_domains() {
     declare -g -A DOMAINS # Declare as global associative array
     if [[ -f "$CONFIG_FILE" ]]; then
         while IFS='=' read -r domain ip; do
+            # Trim whitespace from domain and ip
+            domain=$(echo "$domain" | xargs)
+            ip=$(echo "$ip" | xargs)
             if [[ -n "$domain" && -n "$ip" ]]; then
                 DOMAINS["$domain"]="$ip"
             fi
         done < "$CONFIG_FILE"
-        log_message "info" "Loaded $(wc -l < "$CONFIG_FILE") domains from ${CONFIG_FILE}."
+        log_message "info" "Loaded $(wc -l < "$CONFIG_FILE" 2>/dev/null || echo "0") domains from ${CONFIG_FILE}."
     else
         log_message "warning" "Configuration file ${CONFIG_FILE} not found. Starting fresh."
-        mkdir -p "$CONFIG_DIR" || { log_message "error" "Failed to create config directory."; return 1; }
-        touch "$CONFIG_FILE" || { log_message "error" "Failed to create config file."; return 1; }
+        mkdir -p "$CONFIG_DIR" || { log_message "error" "Failed to create config directory '${CONFIG_DIR}'. Check permissions."; return 1; }
+        touch "$CONFIG_FILE" || { log_message "error" "Failed to create config file '${CONFIG_FILE}'. Check permissions."; return 1; }
     fi
     return 0
 }
@@ -113,6 +122,22 @@ save_domains() {
     done
     log_message "success" "Domains saved to ${CONFIG_FILE}."
 }
+
+# Function to validate a domain name
+is_valid_domain() {
+    local domain="$1"
+    # Basic regex for domain validation (not exhaustive, but good enough for common use)
+    [[ "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]
+}
+
+# Function to validate an IP address
+is_valid_ip() {
+    local ip="$1"
+    # Basic regex for IPv4 validation
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && \
+    $(echo "$ip" | awk -F'.' '{for (i=1;i<=4;i++) if ($i<0 || $i>255) exit 1; exit 0}')
+}
+
 
 # Function to generate Nginx config for a domain
 generate_nginx_config() {
@@ -140,7 +165,9 @@ server {
         proxy_cache_valid 404 1m;
     }
 
-    # Redirect HTTP to HTTPS after Certbot
+    # Certbot will automatically add/uncomment the HTTPS configuration here
+    # after it successfully obtains the certificate.
+    # E.g.,
     # listen 443 ssl http2;
     # listen [::]:443 ssl http2;
     # ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
@@ -154,35 +181,39 @@ EOL
     return 0
 }
 
-# Function to enable Nginx config
+# Function to enable Nginx config (create symlink)
 enable_nginx_config() {
     local domain="$1"
     local available_path="${NGINX_SITES_AVAILABLE}/${domain}.conf"
     local enabled_path="${NGINX_SITES_ENABLED}/${domain}.conf"
 
     if [[ -f "$available_path" ]]; then
-        ln -sf "$available_path" "$enabled_path" || { log_message "error" "Failed to enable Nginx config for ${domain}."; return 1; }
+        if [[ -L "$enabled_path" ]]; then
+            log_message "warning" "Nginx config for ${domain} already enabled. Updating symlink."
+            rm "$enabled_path" # Remove old symlink to create new one if target changed
+        fi
+        ln -s "$available_path" "$enabled_path" || { log_message "error" "Failed to enable Nginx config for ${domain}. Check permissions."; return 1; }
         log_message "success" "Enabled Nginx config for ${domain}."
         return 0
     else
-        log_message "error" "Nginx config file not found for ${domain} at ${available_path}."
+        log_message "error" "Nginx config file not found for ${domain} at ${available_path}. Cannot enable."
         return 1
     fi
 }
 
-# Function to disable Nginx config
+# Function to disable and remove Nginx config
 disable_nginx_config() {
     local domain="$1"
     local enabled_path="${NGINX_SITES_ENABLED}/${domain}.conf"
     local available_path="${NGINX_SITES_AVAILABLE}/${domain}.conf"
 
     if [[ -L "$enabled_path" ]]; then
-        rm "$enabled_path" || { log_message "error" "Failed to disable Nginx config for ${domain}."; return 1; }
-        log_message "success" "Disabled Nginx config symlink for ${domain}."
+        rm "$enabled_path" || { log_message "error" "Failed to remove Nginx enabled symlink for ${domain}."; }
+        log_message "info" "Disabled Nginx config symlink for ${domain}."
     fi
     if [[ -f "$available_path" ]]; then
-        rm "$available_path" || { log_message "error" "Failed to remove Nginx config file for ${domain}."; return 1; }
-        log_message "success" "Removed Nginx config file for ${domain}."
+        rm "$available_path" || { log_message "error" "Failed to remove Nginx available config file for ${domain}."; }
+        log_message "info" "Removed Nginx config file for ${domain}."
     fi
     return 0
 }
@@ -191,31 +222,19 @@ disable_nginx_config() {
 apply_certbot() {
     local domain="$1"
     log_message "info" "Attempting to get SSL certificate for ${domain}..."
-    certbot --nginx -d "${domain}" --non-interactive --agree-tos --email "${EMAIL_FOR_CERTBOT}" || { log_message "warning" "Certbot failed for ${domain}. Please check DNS A record."; return 1; }
-    log_message "success" "SSL certificate obtained for ${domain}."
-    return 0
-}
-
-# Function to update Nginx configs to use HTTPS after Certbot
-update_nginx_to_https() {
-    local domain="$1"
-    local config_path="${NGINX_SITES_AVAILABLE}/${domain}.conf"
-
-    if grep -q "listen 443 ssl" "$config_path"; then
-        log_message "info" "HTTPS configuration already present for ${domain}."
+    # --redirect automatically adds 301 redirects from HTTP to HTTPS
+    # --staple-ocsp enables OCSP stapling for faster SSL handshakes
+    # --hsts adds Strict-Transport-Security header (recommended for security)
+    certbot --nginx -d "${domain}" --non-interactive --agree-tos --email "${EMAIL_FOR_CERTBOT}" --redirect --hsts --staple-ocsp --no-reuse-existing-projects
+    
+    if [[ $? -ne 0 ]]; then
+        log_message "warning" "Certbot failed for ${domain}. This could be due to DNS propagation issues, firewall, or existing certificates. Please verify your DNS A record (pointing THIS VPS IP) is public and port 80/443 are open."
+        log_message "warning" "The tunnel for ${domain} might still work over HTTP, but HTTPS will not be active without a certificate."
+        return 1
+    else
+        log_message "success" "SSL certificate obtained and Nginx configured for HTTPS for ${domain}."
         return 0
     fi
-
-    log_message "info" "Updating Nginx config for ${domain} to redirect to HTTPS and use SSL..."
-    # First, make a temporary file with the updated content
-    sed -i "/listen 80;/a \    listen 443 ssl http2;\n    listen [::]:443 ssl http2;\n    ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;\n    ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;\n    include /etc/letsencrypt/options-ssl-nginx.conf;\n    # ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem; # uncomment if you run certbot with --ssl-dhparam\n\n    if (\$scheme != \"https\") {\n        return 301 https://\$host\$request_uri;\n    }" "${config_path}"
-
-    if [[ $? -ne 0 ]]; then
-        log_message "error" "Failed to update Nginx config for HTTPS for ${domain}."
-        return 1
-    fi
-    log_message "success" "Nginx config updated for ${domain} to use HTTPS."
-    return 0
 }
 
 
@@ -232,42 +251,59 @@ add_domain() {
         press_enter_to_continue
         return
     fi
+    if ! is_valid_domain "$subdomain"; then
+        log_message "error" "Invalid subdomain format. Please use a valid domain name (e.g., example.com or sub.example.com)."
+        press_enter_to_continue
+        return
+    fi
+
 
     if [[ "${DOMAINS[$subdomain]}" ]]; then
         log_message "warning" "Subdomain '${subdomain}' already exists with IP: ${DOMAINS[$subdomain]}."
-        press_enter_to_continue
-        return
+        read -rp "Do you want to update its main server IP? (y/N): " update_confirm
+        if [[ "$update_confirm" != "y" && "$update_confirm" != "Y" ]]; then
+            log_message "info" "Operation cancelled."
+            press_enter_to_continue
+            return
+        fi
     fi
 
     read -rp "Enter the main server IP for ${subdomain}: " ip_address
 
-    if [[ ! "$ip_address" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        log_message "error" "Invalid IP address format."
+    if ! is_valid_ip "$ip_address"; then
+        log_message "error" "Invalid IP address format. Please enter a valid IPv4 address (e.g., 192.168.1.1)."
         press_enter_to_continue
         return
     fi
 
-    log_message "info" "Adding ${subdomain} pointing to ${ip_address}..."
+    log_message "info" "Adding/Updating ${subdomain} pointing to ${ip_address}..."
     DOMAINS["$subdomain"]="$ip_address"
     save_domains
+
+    # Ensure Nginx is running before generating config
+    systemctl is-active --quiet nginx || systemctl start nginx
 
     generate_nginx_config "$subdomain" "$ip_address" && \
     enable_nginx_config "$subdomain" && \
     systemctl reload nginx && \
-    log_message "success" "Nginx reloaded for initial HTTP config." && \
-    apply_certbot "$subdomain" && \
-    update_nginx_to_https "$subdomain" && \
-    systemctl reload nginx && \
-    log_message "success" "Successfully added and configured ${subdomain} with SSL." || \
-    log_message "error" "Failed to add and configure ${subdomain}. Please check logs."
+    log_message "success" "Nginx reloaded with initial HTTP config for ${subdomain}."
+
+    # Attempt Certbot and update Nginx for HTTPS
+    if apply_certbot "$subdomain"; then
+        systemctl reload nginx && \
+        log_message "success" "Final Nginx reload for ${subdomain} with HTTPS."
+    else
+        log_message "warning" "HTTPS setup for ${subdomain} might be incomplete. Please check logs and Cloudflare DNS."
+    fi
 
     log_message "info" "--- IMPORTANT Cloudflare Steps ---"
-    log_message "info" "1. In Cloudflare, keep your existing **proxied (orange cloud)** A record for '${subdomain}' pointing to your main server."
-    log_message "info" "2. Add a **SECOND A record** for '${subdomain}' (or your main domain if this is root) with:"
+    log_message "info" "1. In Cloudflare, if you have an existing record for '${subdomain}', ensure it's **proxied (orange cloud)** and points to your **main server's IP**."
+    log_message "info" "2. Add a **SECOND A record** for '${subdomain}' with the following details:"
+    log_message "info" "   - **Type:** A"
     log_message "info" "   - **Name:** '${subdomain}'"
     log_message "info" "   - **Content:** The IP address of **THIS Iran VPS**"
-    log_message "info" "   - **Proxy status:** DISABLED (gray cloud)"
-    log_message "info" "This setup ensures the Iran VPS handles traffic from Iran, and your main server handles direct traffic."
+    log_message "info" "   - **Proxy status:** DISABLED (gray cloud) - This is CRITICAL for the tunnel to work!"
+    log_message "info" "This setup ensures traffic from specific regions hits this VPS, while general traffic uses your main server via Cloudflare's proxy."
     
     press_enter_to_continue
 }
@@ -293,34 +329,46 @@ list_and_delete_domain() {
     echo ""
     read -rp "Enter the number of the subdomain to delete, or 0 to return to main menu: " choice
 
+    # Input validation
+    if ! [[ "$choice" =~ ^[0-9]+$ ]]; then
+        log_message "error" "Invalid input. Please enter a number."
+        press_enter_to_continue
+        return
+    fi
+
     if [[ "$choice" -eq 0 ]]; then
         log_message "info" "Returning to main menu."
         return
     fi
 
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#domain_list[@]}" ]]; then
+    if [[ "$choice" -ge 1 ]] && [[ "$choice" -le "${#domain_list[@]}" ]]; then
         local domain_to_delete="${domain_list[choice-1]}"
-        read -rp "Are you sure you want to delete '${domain_to_delete}'? (y/N): " confirm
+        read -rp "Are you sure you want to delete '${domain_to_delete}'? This will remove its Nginx config and Certbot certificate. (y/N): " confirm
         if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
             log_message "info" "Deleting ${domain_to_delete}..."
+            
+            # Disable Nginx config first
             disable_nginx_config "$domain_to_delete"
+
             # Attempt to remove Certbot certificate if it exists
+            log_message "info" "Attempting to remove Certbot certificate for ${domain_to_delete}..."
             certbot delete --non-interactive --cert-name "$domain_to_delete" &>/dev/null
             if [[ $? -eq 0 ]]; then
                 log_message "success" "Certbot certificate for ${domain_to_delete} removed."
             else
-                log_message "warning" "No Certbot certificate found or failed to remove for ${domain_to_delete}."
+                log_message "warning" "No Certbot certificate found or failed to remove for ${domain_to_delete}. This might be normal if it failed to issue initially."
             fi
             
             unset DOMAINS["$domain_to_delete"]
             save_domains
-            systemctl reload nginx || log_message "error" "Failed to reload Nginx after deletion."
+            
+            systemctl reload nginx || log_message "error" "Failed to reload Nginx after deletion. Manual check needed."
             log_message "success" "Successfully deleted ${domain_to_delete}."
         else
             log_message "info" "Deletion cancelled."
         fi
     else
-        log_message "error" "Invalid choice."
+        log_message "error" "Invalid choice. Please enter a number from the list or 0."
     fi
     press_enter_to_continue
 }
@@ -328,28 +376,28 @@ list_and_delete_domain() {
 remove_all() {
     clear
     log_message "warning" "--- Remove Everything ---"
-    read -rp "This will remove all Nginx configurations, Certbot data, and dependencies installed by this script. Are you absolutely sure? (y/N): " confirm
-    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+    read -rp "${RED}This will remove ALL Nginx configurations, ALL Certbot data, and ALL dependencies installed by this script. This action is irreversible. Are you absolutely sure you want to proceed? (type 'yes' to confirm):${NC} " confirm_full
+
+    if [[ "$confirm_full" == "yes" ]]; then
         log_message "info" "Proceeding with complete removal..."
 
         # Stop and disable Nginx
+        log_message "info" "Stopping and disabling Nginx service..."
         systemctl stop nginx &>/dev/null
         systemctl disable nginx &>/dev/null
-        log_message "info" "Nginx stopped and disabled."
+        log_message "success" "Nginx stopped and disabled."
 
-        # Remove all Nginx site configs
-        log_message "info" "Removing Nginx site configurations..."
+        # Remove all Nginx site configs and main conf
+        log_message "info" "Removing Nginx site configurations and cache..."
         rm -rf "${NGINX_SITES_AVAILABLE}"/* &>/dev/null
         rm -rf "${NGINX_SITES_ENABLED}"/* &>/dev/null
-        # Restore default Nginx conf, or remove it entirely
-        # For simplicity, let's remove everything for now.
         rm -f /etc/nginx/nginx.conf &>/dev/null
         rm -rf /var/cache/nginx &>/dev/null
         log_message "success" "Nginx site configurations and cache removed."
 
         # Remove Certbot certificates and data
         log_message "info" "Removing Certbot certificates and data..."
-        certbot unregister --non-interactive || log_message "warning" "Certbot unregister failed or no account exists."
+        certbot unregister --non-interactive || log_message "warning" "Certbot unregister failed or no account exists (might be normal if no certs were issued)."
         rm -rf /etc/letsencrypt &>/dev/null
         log_message "success" "Certbot data removed."
 
@@ -370,12 +418,19 @@ remove_all() {
         log_message "success" "Certbot renewal cron job removed."
 
         # Remove the script itself
-        log_message "info" "Removing the script itself..."
-        rm -f "$(readlink -f "$0")" &>/dev/null # Get the real path of the script
-        log_message "success" "Script ${SCRIPT_NAME} removed."
+        log_message "info" "Removing the script itself from /usr/local/bin/..."
+        # Get the actual path of the currently executing script
+        CURRENT_SCRIPT_PATH="$(readlink -f "$0")"
+        if [[ "$CURRENT_SCRIPT_PATH" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
+            rm -f "$CURRENT_SCRIPT_PATH" &>/dev/null
+            log_message "success" "Script ${SCRIPT_NAME} removed."
+        else
+            log_message "warning" "Script not found at expected path /usr/local/bin/${SCRIPT_NAME}. It might be running from a temporary location."
+            log_message "info" "You may need to manually remove any lingering copies."
+        fi
 
         log_message "success" "All components installed by this script have been removed."
-        log_message "info" "You may need to reboot your server for all changes to take full effect."
+        log_message "info" "It is highly recommended to reboot your server now to ensure all changes take full effect: 'sudo reboot'"
         exit 0
     else
         log_message "info" "Removal cancelled."
@@ -404,49 +459,34 @@ display_menu() {
     esac
 }
 
-# --- Initial Script Execution Check ---
-
-self_download_and_run() {
-    local script_path="/usr/local/bin/${SCRIPT_NAME}" # A common place for user-managed scripts
-    
-    if [[ ! -f "$script_path" || "$1" == "force_download" ]]; then
-        log_message "info" "Script not found locally or forced download. Downloading ${SCRIPT_NAME} from GitHub..."
-        if command -v curl &>/dev/null; then
-            curl -sL "$GITHUB_RAW_URL" -o "$script_path"
-        elif command -v wget &>/dev/null; then
-            wget -qO "$script_path" "$GITHUB_RAW_URL"
-        else
-            log_message "error" "Neither curl nor wget found. Please install one to download the script."
-            exit 1
-        fi
-        
-        if [[ $? -ne 0 ]]; then
-            log_message "error" "Failed to download ${SCRIPT_NAME} from GitHub. Check the URL and your network connection."
-            exit 1
-        fi
-        chmod +x "$script_path"
-        log_message "success" "${SCRIPT_NAME} downloaded to ${script_path} and made executable."
-        exec "$script_path" # Execute the downloaded script
-    else
-        log_message "info" "${SCRIPT_NAME} already exists at ${script_path}. Opening menu."
-    fi
-}
-
-# --- Main Execution Flow ---
+# --- Initial Script Execution Check and Main Flow ---
 check_root
 
-# If the script is executed directly from GitHub or not yet installed,
-# it will attempt to download itself to /usr/local/bin/ and then execute.
-# Otherwise, it will just proceed to the main logic.
-if [[ "$(basename "$0")" == "$SCRIPT_NAME" ]]; then
-    # If this is the downloaded script, proceed
-    load_domains
+# This block determines if the script is being run for the first time via curl/wget
+# or if it's already installed locally and being run directly.
+if [[ "$(basename "$0")" == "$SCRIPT_NAME" || -z "$(grep -l "${SCRIPT_NAME}" "$0")" ]]; then
+    # This condition is tricky to make universally robust for self-execution.
+    # The simple check `if [[ "$(basename "$0")" == "$SCRIPT_NAME" ]]` will only be true
+    # if the script is called directly by its name (e.g., `iran_vps_tunnel_manager.sh`).
+    # If called via `bash -c "$(curl ...)"`, `basename "$0"` will be "bash".
+    #
+    # The primary goal is that the initial `curl | bash` downloads and then `exec`s itself.
+    # Once `exec`ed, it will run as `/usr/local/bin/iran_vps_tunnel_manager.sh` and then hit this `if` block.
+    #
+    # So, the logic here implies: If we are running the *installed* version of the script,
+    # or if this is the very first execution that is downloading itself,
+    # we need to proceed with dependency installation and the main menu loop.
+
+    load_domains || { log_message "error" "Failed to load domains. Exiting."; exit 1; }
+
+    # Only install dependencies and setup cron if they haven't been done
     if install_dependencies; then
         # Set up certbot renewal only once if not already set
         if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
             (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
             log_message "success" "Certbot renewal cron job added."
         fi
+        
         while true; do
             display_menu
         done
@@ -455,6 +495,7 @@ if [[ "$(basename "$0")" == "$SCRIPT_NAME" ]]; then
         exit 1
     fi
 else
-    # This is the initial execution that will self-download
+    # This branch is primarily for the *very first* execution via `curl | bash`
+    # It handles the self-downloading process.
     self_download_and_run
 fi
