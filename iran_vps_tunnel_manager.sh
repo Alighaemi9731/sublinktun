@@ -1,52 +1,74 @@
 #!/bin/bash
 
-# Configuration
-CONFIG_DIR="/etc/iran_vps_tunnel"
-CONFIG_FILE="${CONFIG_DIR}/config.txt"
-SCRIPT_PATH="/usr/local/bin/iran_vps_tunnel_manager"
-SCRIPT_URL="https://raw.githubusercontent.com/Alighaemi9731/sublinktun/main/iran_vps_tunnel_manager.sh"
-EMAIL="alighaemi@gmail.com"  # Certbot email
+#================================================================================#
+#            Nginx Tunnel Manager - by Gemini @ Google (for Alighaemi)           #
+#                                                                                #
+#  A script to easily add, remove, and manage Nginx reverse proxy tunnels        #
+#  with automated SSL certificate generation via Certbot.                        #
+#                                                                                #
+#================================================================================#
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# --- Configuration ---
+# File to store the mapping of subdomains to their origin server IPs.
+CONFIG_FILE="/etc/nginx/tunnel_manager.conf"
+# User email for Let's Encrypt SSL notifications. Will be prompted on first run.
+EMAIL_FILE="/etc/nginx/certbot_email.conf"
+MY_EMAIL=""
 
-# Install script if not present
-install_script() {
-    echo -e "${YELLOW}Installing Iran VPS Tunnel Manager...${NC}"
-    mkdir -p "${CONFIG_DIR}"
-    touch "${CONFIG_FILE}"
-    curl -sL "${SCRIPT_URL}" -o "${SCRIPT_PATH}"
-    chmod +x "${SCRIPT_PATH}"
-    echo -e "${GREEN}Installation complete! Running manager...${NC}"
-    sleep 2
-    "${SCRIPT_PATH}"
-    exit 0
+# --- Colors for UI ---
+C_RESET='\033[0m'
+C_RED='\033[0;31m'
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_BLUE='\033[0;34m'
+C_CYAN='\033[0;36m'
+
+# --- Helper Functions ---
+function print_success() {
+    echo -e "${C_GREEN}[SUCCESS]${C_RESET} $1"
 }
 
-# Check if we need to install
-if [ ! -d "${CONFIG_DIR}" ] || [ ! -f "${SCRIPT_PATH}" ]; then
-    install_script
-fi
+function print_error() {
+    echo -e "${C_RED}[ERROR]${C_RESET} $1"
+}
 
-# Main Functions
-initial_nginx_setup() {
-    echo -e "${YELLOW}Setting up Nginx environment...${NC}"
-    apt update > /dev/null 2>&1
-    apt install -y nginx certbot python3-certbot-nginx > /dev/null 2>&1
+function print_info() {
+    echo -e "${C_CYAN}[INFO]${C_RESET} $1"
+}
+
+function check_root() {
+    if [ "$(id -u)" -ne 0 ]; then
+        print_error "This script must be run as root. Please use 'sudo'."
+        exit 1
+    fi
+}
+
+# --- Core Logic ---
+
+# Function to run the initial setup and install required packages.
+function initial_setup() {
+    if command -v nginx &> /dev/null && command -v certbot &> /dev/null; then
+        print_info "Nginx and Certbot are already installed."
+        return
+    fi
     
-    # Create cache directory
+    print_info "Updating system and installing required packages (Nginx, Certbot)..."
+    apt update && apt upgrade -y
+    if ! apt install -y nginx certbot python3-certbot-nginx; then
+        print_error "Failed to install required packages. Please check your system's package manager."
+        exit 1
+    fi
+
+    print_info "Creating Nginx cache directory..."
     mkdir -p /var/cache/nginx
     chown -R www-data:www-data /var/cache/nginx
 
-    # Configure main nginx.conf
-    if ! grep -q "proxy_cache_path" /etc/nginx/nginx.conf; then
-        cat > /etc/nginx/nginx.conf <<EOL
+    print_info "Writing main Nginx configuration..."
+    cat > /etc/nginx/nginx.conf <<EOL
 user www-data;
 worker_processes auto;
 pid /run/nginx.pid;
+include /etc/nginx/modules-enabled/*.conf;
 
 events {
     worker_connections 1024;
@@ -55,6 +77,7 @@ events {
 http {
     proxy_cache_path /var/cache/nginx levels=1:2 keys_zone=my_cache:50m inactive=60m use_temp_path=off;
     server_names_hash_bucket_size 64;
+
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
     
@@ -71,42 +94,40 @@ http {
     include /etc/nginx/sites-enabled/*;
 }
 EOL
-    fi
-    echo -e "${GREEN}Nginx setup complete!${NC}"
-    sleep 1
+    
+    print_info "Setting up Certbot renewal cron job..."
+    (crontab -l 2>/dev/null | grep -v 'certbot renew'; echo "0 4 * * * /usr/bin/certbot renew --quiet") | crontab -
+
+    systemctl enable nginx
+    systemctl start nginx
+    print_success "Initial setup complete."
 }
 
-add_tunnel() {
+# Function to add a new subdomain tunnel.
+function add_domain() {
     clear
-    echo -e "${YELLOW}=== Add New Tunnel ===${NC}"
+    echo -e "${C_BLUE}--- Add New Subdomain Tunnel ---${C_RESET}"
     
-    while true; do
-        read -p "Enter subdomain (e.g., example.domain.com): " subdomain
-        if [[ "$subdomain" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-            break
-        else
-            echo -e "${RED}Invalid subdomain format!${NC}"
-        fi
-    done
-    
-    while true; do
-        read -p "Enter origin server IP: " origin_ip
-        if [[ "$origin_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            break
-        else
-            echo -e "${RED}Invalid IP address!${NC}"
-        fi
-    done
-
-    # Save to config
-    echo "${subdomain}=${origin_ip}" >> "${CONFIG_FILE}"
-    
-    # Initial Nginx setup if needed
-    if ! nginx -v > /dev/null 2>&1; then
-        initial_nginx_setup
+    read -p "Enter the subdomain (e.g., sub.example.com): " subdomain
+    if [[ -z "$subdomain" ]]; then
+        print_error "Subdomain cannot be empty."
+        return
     fi
 
-    # Create Nginx config
+    read -p "Enter the main server's IP address for this subdomain: " server_ip
+    if [[ -z "$server_ip" ]]; then
+        print_error "Server IP cannot be empty."
+        return
+    fi
+    
+    # Check if domain already exists
+    if grep -q "^${subdomain} " "${CONFIG_FILE}"; then
+        print_error "This subdomain is already configured."
+        return
+    fi
+
+    print_info "Creating Nginx configuration for ${subdomain}..."
+    
     cat > "/etc/nginx/sites-available/${subdomain}.conf" <<EOL
 server {
     listen 80;
@@ -114,150 +135,194 @@ server {
     server_name ${subdomain};
 
     location / {
-        proxy_pass https://${origin_ip};
+        proxy_pass http://${server_ip}; # We will use HTTP here and let Certbot handle HTTPS redirect
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
         
-        proxy_ssl_server_name on;
-        proxy_ssl_name ${subdomain};
-        
+        # Caching configuration
         proxy_cache my_cache;
-        proxy_cache_valid 200 302 30m;
+        proxy_cache_valid 200 302 60m;
         proxy_cache_valid 404 1m;
+        proxy_cache_use_stale error timeout updating http_500 http_502 http_503 http_504;
+        add_header X-Proxy-Cache \$upstream_cache_status;
     }
 }
 EOL
 
-    # Enable site
-    ln -sf "/etc/nginx/sites-available/${subdomain}.conf" "/etc/nginx/sites-enabled/"
-    
-    # Test and reload Nginx
-    if nginx -t; then
+    ln -s "/etc/nginx/sites-available/${subdomain}.conf" "/etc/nginx/sites-enabled/"
+
+    print_info "Testing Nginx configuration..."
+    if ! nginx -t; then
+        print_error "Nginx configuration test failed. Reverting changes."
+        rm "/etc/nginx/sites-available/${subdomain}.conf"
+        rm "/etc/nginx/sites-enabled/${subdomain}"
+        nginx -t
         systemctl reload nginx
-        echo -e "${GREEN}Nginx configuration validated!${NC}"
-    else
-        echo -e "${RED}Nginx configuration error! Check logs.${NC}"
-        return 1
-    fi
-
-    # Get SSL certificate
-    echo -e "${YELLOW}Requesting SSL certificate...${NC}"
-    certbot --nginx -d "${subdomain}" --non-interactive --agree-tos --email "${EMAIL}"
-    
-    # Setup renewal cron if not exists
-    if ! crontab -l | grep -q "certbot renew"; then
-        (crontab -l 2>/dev/null; echo "0 12 * * * /usr/bin/certbot renew --quiet") | crontab -
-    fi
-
-    echo -e "${GREEN}\nTunnel added successfully!${NC}"
-    echo -e "Remember to add Cloudflare DNS records:\n1. Proxied A record → Main server\n2. Non-proxied A record → Iran VPS IP"
-    read -p "Press [Enter] to continue"
-}
-
-delete_tunnel() {
-    local domain=$1
-    local ip=$2
-    
-    # Remove from config
-    sed -i "/^${domain}=/d" "${CONFIG_FILE}"
-    
-    # Remove Nginx configs
-    rm -f "/etc/nginx/sites-available/${domain}.conf"
-    rm -f "/etc/nginx/sites-enabled/${domain}.conf"
-    
-    # Remove Certbot certificate
-    certbot delete --cert-name "${domain}" --non-interactive > /dev/null 2>&1
-    
-    # Reload Nginx
-    systemctl reload nginx
-    
-    echo -e "${GREEN}Tunnel for ${domain} removed!${NC}"
-    sleep 1
-}
-
-manage_tunnels() {
-    while true; do
-        clear
-        echo -e "${YELLOW}=== Manage Tunnels ===${NC}"
-        
-        if [ ! -s "${CONFIG_FILE}" ]; then
-            echo -e "${RED}No tunnels configured!${NC}"
-            read -p "Press [Enter] to return"
-            return
-        fi
-
-        declare -A tunnels
-        i=1
-        while IFS="=" read -r domain ip; do
-            tunnels[$i]="$domain:$ip"
-            echo "$i. $domain → $ip"
-            ((i++))
-        done < "${CONFIG_FILE}"
-        
-        echo -e "\n$i. Back to Main Menu"
-        read -p "Select tunnel to delete: " choice
-        
-        if [ "$choice" -eq "$i" ] 2>/dev/null; then
-            return
-        elif [ "$choice" -gt 0 ] && [ "$choice" -lt "$i" ] 2>/dev/null; then
-            IFS=':' read -r domain ip <<< "${tunnels[$choice]}"
-            read -p $"Delete tunnel for ${RED}${domain}${NC}? [y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                delete_tunnel "$domain" "$ip"
-            fi
-        else
-            echo -e "${RED}Invalid selection!${NC}"
-            sleep 1
-        fi
-    done
-}
-
-uninstall_all() {
-    clear
-    echo -e "${RED}=== COMPLETE UNINSTALL ===${NC}"
-    read -p "This will remove ALL tunnels and configurations! Continue? [y/N]: " confirm
-    
-    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         return
     fi
+
+    print_info "Reloading Nginx..."
+    systemctl reload nginx
+
+    print_info "Requesting SSL certificate from Let's Encrypt..."
+    if ! certbot --nginx --non-interactive --agree-tos --email "${MY_EMAIL}" -d "${subdomain}" --redirect; then
+         print_error "Certbot failed to obtain an SSL certificate. The site is currently HTTP only."
+         print_error "Please check DNS records are pointing to this server and try again."
+    else
+        print_success "SSL certificate obtained and configured successfully."
+    fi
+
+    echo "${subdomain} ${server_ip}" >> "${CONFIG_FILE}"
+    print_success "Tunnel for ${subdomain} -> ${server_ip} has been created."
+    read -n 1 -s -r -p "Press any key to return to the menu..."
+}
+
+# Function to show and allow deletion of a domain.
+function delete_domain() {
+    clear
+    echo -e "${C_YELLOW}--- Delete a Subdomain Tunnel ---${C_RESET}"
     
-    # Remove all tunnels
-    while IFS="=" read -r domain ip; do
-        delete_tunnel "$domain" "$ip"
-    done < "${CONFIG_FILE}"
+    if [ ! -s "${CONFIG_FILE}" ]; then
+        print_error "No domains have been configured yet."
+        read -n 1 -s -r -p "Press any key to return to the menu..."
+        return
+    fi
+
+    mapfile -t domains < "${CONFIG_FILE}"
     
-    # Remove config directory
-    rm -rf "${CONFIG_DIR}"
+    echo "Select the domain to delete:"
+    i=1
+    for domain_entry in "${domains[@]}"; do
+        echo "  $i) $domain_entry"
+        i=$((i+1))
+    done
+    echo "  0) Back to Main Menu"
     
-    # Remove script
-    rm -f "${SCRIPT_PATH}"
+    read -p "Enter your choice [0-$((${#domains[@]}))]: " choice
+
+    if [[ "$choice" -eq 0 ]]; then
+        return
+    fi
+
+    if [[ "$choice" -gt 0 && "$choice" -le ${#domains[@]} ]]; then
+        selection_index=$((choice-1))
+        domain_to_delete=$(echo "${domains[$selection_index]}" | awk '{print $1}')
+        
+        read -p "Are you sure you want to delete the tunnel for ${domain_to_delete}? [y/N]: " confirm
+        if [[ "${confirm,,}" != "y" ]]; then
+            print_info "Deletion cancelled."
+            return
+        fi
+
+        print_info "Deleting configuration for ${domain_to_delete}..."
+        rm -f "/etc/nginx/sites-available/${domain_to_delete}.conf"
+        rm -f "/etc/nginx/sites-enabled/${domain_to_delete}"
+
+        # Use a temporary file to remove the line from the config
+        grep -v "^${domain_to_delete} " "${CONFIG_FILE}" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "${CONFIG_FILE}"
+
+        print_info "Testing and reloading Nginx..."
+        nginx -t && systemctl reload nginx
+        
+        print_success "Tunnel for ${domain_to_delete} has been successfully deleted."
+        print_info "Note: The SSL certificate will be pruned on the next Certbot renewal."
+
+    else
+        print_error "Invalid choice."
+    fi
+    read -n 1 -s -r -p "Press any key to return to the menu..."
+}
+
+# Function to completely remove everything the script has done.
+function uninstall_script() {
+    clear
+    echo -e "${C_RED}--- UNINSTALL AND REMOVE EVERYTHING ---${C_RESET}"
+    read -p "WARNING: This will delete ALL tunnels, Nginx configs, Certbot certs, and uninstall packages. This is IRREVERSIBLE. Are you absolutely sure? [y/N]: " confirm
+    if [[ "${confirm,,}" != "y" ]]; then
+        print_info "Uninstall cancelled."
+        return
+    fi
+
+    print_info "Deleting all configured tunnels..."
+    if [ -f "${CONFIG_FILE}" ]; then
+        while read -r subdomain server_ip; do
+            print_info "Removing ${subdomain}..."
+            rm -f "/etc/nginx/sites-available/${subdomain}.conf"
+            rm -f "/etc/nginx/sites-enabled/${subdomain}"
+        done < "${CONFIG_FILE}"
+    fi
     
-    # Remove cronjob
-    crontab -l | grep -v "certbot renew" | crontab -
-    
-    echo -e "${GREEN}Uninstallation complete! All components removed.${NC}"
+    print_info "Purging Nginx and Certbot packages..."
+    systemctl stop nginx
+    apt-get purge --auto-remove -y nginx nginx-common certbot python3-certbot-nginx
+
+    print_info "Deleting all remaining configuration and log files..."
+    rm -rf /etc/nginx
+    rm -rf /var/log/nginx
+    rm -rf /var/cache/nginx
+    rm -rf /etc/letsencrypt
+
+    print_info "Removing Certbot cron job..."
+    crontab -l | grep -v 'certbot renew' | crontab -
+
+    print_info "Deleting this manager script..."
+    rm -f /usr/local/bin/iran-tunnel-manager
+
+    print_success "Uninstallation complete. The system is now clean of this script's changes."
     exit 0
 }
 
-# Main Menu
-while true; do
-    clear
-    echo -e "${YELLOW}===================================${NC}"
-    echo -e "${YELLOW}    Iran VPS Tunnel Manager        ${NC}"
-    echo -e "${YELLOW}===================================${NC}"
-    echo "1. Add new tunnel"
-    echo "2. Manage existing tunnels"
-    echo "3. COMPLETE UNINSTALL"
-    echo "4. Exit"
-    echo -e "${YELLOW}===================================${NC}"
-    
-    read -p "Choose option: " choice
-    case $choice in
-        1) add_tunnel ;;
-        2) manage_tunnels ;;
-        3) uninstall_all ;;
-        4) exit 0 ;;
-        *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
-    esac
-done
+# Function to display the main menu.
+function main_menu() {
+    while true; do
+        clear
+        echo -e "${C_CYAN}=======================================${C_RESET}"
+        echo -e "${C_BLUE}  Iran VPS Nginx Tunnel Manager Menu   ${C_RESET}"
+        echo -e "${C_CYAN}=======================================${C_RESET}"
+        echo
+        echo -e "${C_GREEN}   1. Add New Subdomain Tunnel${C_RESET}"
+        echo -e "${C_YELLOW}   2. Delete a Subdomain Tunnel${C_RESET}"
+        echo -e "${C_RED}   3. Uninstall Everything${C_RESET}"
+        echo "   4. Exit"
+        echo
+        echo "---------------------------------------"
+        echo -e "${C_CYAN}Configured Tunnels:${C_RESET}"
+        if [ -s "${CONFIG_FILE}" ]; then
+            cat -n "${CONFIG_FILE}"
+        else
+            echo "   No tunnels configured yet."
+        fi
+        echo "---------------------------------------"
+        
+        read -p "Enter your choice [1-4]: " choice
+        
+        case $choice in
+            1) add_domain ;;
+            2) delete_domain ;;
+            3) uninstall_script ;;
+            4) clear; exit 0 ;;
+            *) print_error "Invalid option. Please try again." ; read -n 1 -s -r -p "" ;;
+        esac
+    done
+}
+
+
+# --- Main Execution ---
+check_root
+initial_setup
+
+# Create config files if they don't exist
+touch "${CONFIG_FILE}"
+
+# Get user email for Certbot if not set
+if [ ! -f "$EMAIL_FILE" ]; then
+    read -p "Please enter your email address (for SSL certificate notifications): " user_email
+    echo "$user_email" > "$EMAIL_FILE"
+    MY_EMAIL=$user_email
+else
+    MY_EMAIL=$(cat "$EMAIL_FILE")
+fi
+
+main_menu
