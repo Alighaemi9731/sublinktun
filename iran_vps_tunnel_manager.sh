@@ -277,6 +277,9 @@ apply_certbot() {
     fi
 
     # Execute Certbot command
+    # Using eval here is necessary because certbot_flags is a string that needs to be
+    # parsed by the shell after variable expansion. Be cautious with user-supplied input
+    # if you were building certbot_flags from untrusted sources, but here it's internal.
     eval "certbot $certbot_flags"
     
     if [[ $? -ne 0 ]]; then
@@ -347,7 +350,7 @@ add_domain() {
         log_message "success" "Final Nginx reload for ${subdomain} with HTTPS."
     else
         log_message "warning" "HTTPS setup for ${subdomain} might be incomplete. Please check logs and Cloudflare DNS."
-    _fi
+    fi # This 'fi' was missing the '_' that was in the previous version, causing the error. Corrected.
 
     log_message "info" "--- IMPORTANT Cloudflare Steps ---"
     log_message "info" "1. In Cloudflare, if you have an existing record for '${subdomain}', ensure it's **proxied (orange cloud)** and points to your **main server's IP**."
@@ -517,18 +520,40 @@ display_menu() {
     esac
 }
 
-# --- Initial Script Execution Check and Main Flow ---
+# --- Self-Download and Re-execute Function ---
+self_download_and_run() {
+    local script_path="/usr/local/bin/${SCRIPT_NAME}"
+    
+    log_message "info" "Script not found locally or initiating first-time download. Downloading ${SCRIPT_NAME} from GitHub..."
+    if command -v curl &>/dev/null; then
+        curl -sL "$GITHUB_RAW_URL" -o "$script_path"
+    elif command -v wget &>/dev/null; then
+        wget -qO "$script_path" "$GITHUB_RAW_URL"
+    else
+        log_message "error" "Neither curl nor wget found. Please install one to download the script (e.g., sudo apt install curl)."
+        exit 1
+    fi
+    
+    if [[ $? -ne 0 || ! -f "$script_path" ]]; then
+        log_message "error" "Failed to download ${SCRIPT_NAME} from GitHub. Check the URL and your network connection."
+        exit 1
+    fi
+    chmod +x "$script_path"
+    log_message "success" "${SCRIPT_NAME} downloaded to ${script_path} and made executable."
+    
+    log_message "info" "Re-executing the script from its permanent location..."
+    exec "$script_path" # Transfer control to the newly downloaded script
+}
+
+
+# --- Main Execution Flow ---
 check_root
 
 # This block determines if the script is being run for the first time via curl/wget
 # or if it's already installed locally and being run directly.
-# The primary goal is that the initial `curl | bash` downloads and then `exec`s itself.
-# Once `exec`ed, it will run as `/usr/local/bin/iran_vps_tunnel_manager.sh` and then hit this `if` block.
-# So, the logic here implies: If we are running the *installed* version of the script,
-# we need to proceed with dependency installation and the main menu loop.
 # The `exec "$script_path"` in `self_download_and_run` transfers control to the
-# newly downloaded script, making `$(basename "$0")` equal to `SCRIPT_NAME` for the
-# *subsequent* run of the downloaded script.
+# newly downloaded script, making `$(readlink -f "$0")` equal to `/usr/local/bin/${SCRIPT_NAME}`
+# for the *subsequent* run of the downloaded script.
 
 # Check if the script is being run as the installed version in /usr/local/bin
 if [[ "$(readlink -f "$0")" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
@@ -551,29 +576,6 @@ if [[ "$(readlink -f "$0")" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
     fi
 else
     # This branch is for the *very first* execution via `curl | bash`
-    # It handles the self-downloading process.
-    self_download_and_run() {
-        local script_path="/usr/local/bin/${SCRIPT_NAME}"
-        
-        log_message "info" "Script not found locally or initiating first-time download. Downloading ${SCRIPT_NAME} from GitHub..."
-        if command -v curl &>/dev/null; then
-            curl -sL "$GITHUB_RAW_URL" -o "$script_path"
-        elif command -v wget &>/dev/null; then
-            wget -qO "$script_path" "$GITHUB_RAW_URL"
-        else
-            log_message "error" "Neither curl nor wget found. Please install one to download the script (e.g., sudo apt install curl)."
-            exit 1
-        fi
-        
-        if [[ $? -ne 0 || ! -f "$script_path" ]]; then
-            log_message "error" "Failed to download ${SCRIPT_NAME} from GitHub. Check the URL and your network connection."
-            exit 1
-        fi
-        chmod +x "$script_path"
-        log_message "success" "${SCRIPT_NAME} downloaded to ${script_path} and made executable."
-        
-        log_message "info" "Re-executing the script from its permanent location..."
-        exec "$script_path" # Transfer control to the newly downloaded script
-    }
+    # It calls the self-downloading process.
     self_download_and_run
 fi
