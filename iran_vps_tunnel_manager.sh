@@ -177,8 +177,8 @@ delete_ssl_certificate_files() {
         return 0
     else
         error_message "Failed to delete SSL certificate files for ${domain}. It might already be removed or an error occurred."
-        return 1
-    }
+        return 1 # <--- THIS LINE WAS MISSING IN THE PREVIOUS VERSION
+    fi
 }
 
 # --- Main Script Functions ---
