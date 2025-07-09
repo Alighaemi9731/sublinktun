@@ -10,7 +10,7 @@ CONFIG_FILE="${CONFIG_DIR}/domains.conf"
 NGINX_SITES_AVAILABLE="/etc/nginx/sites-available"
 NGINX_SITES_ENABLED="/etc/nginx/sites-enabled"
 # IMPORTANT: Update this line with your actual email for Certbot notifications
-EMAIL_FOR_CERTBOT="your-email@example.com" 
+EMAIL_FOR_CERTBOT="your-email@example.com"
 
 # --- Text Colors ---
 RED='\033[0;31m'
@@ -47,13 +47,49 @@ check_root() {
     fi
 }
 
-# Function to ensure Nginx and Certbot are installed and configured
+# Function to install Nginx and Certbot
 install_dependencies() {
-    log_message "info" "Checking for updates and installing dependencies (Nginx, Certbot)..."
+    log_message "info" "Updating system and installing dependencies (Nginx, Certbot)..."
     apt update -y || { log_message "error" "Failed to update package lists."; return 1; }
     apt upgrade -y || { log_message "warning" "Failed to upgrade packages, continuing..."; }
-    apt install -y nginx certbot python3-certbot-nginx || { log_message "error" "Failed to install required packages. Please check your internet connection or repository access."; return 1; }
-    log_message "success" "Dependencies installed."
+
+    # Try to install Certbot via snapd first (recommended for latest version)
+    if ! command -v certbot &>/dev/null || [[ "$(certbot --version 2>&1)" =~ "command not found" ]]; then
+        log_message "info" "Attempting to install Certbot via snapd..."
+        if ! command -v snap &>/dev/null; then
+            log_message "info" "snapd not found, installing snapd..."
+            apt install snapd -y || { log_message "error" "Failed to install snapd."; return 1; }
+            log_message "success" "snapd installed."
+            systemctl enable --now snapd.socket || log_message "warning" "Failed to enable snapd socket."
+            # Ensure /snap is symlinked for older systems, common on VPS
+            if [[ ! -d /snap && -d /var/lib/snapd/snap ]]; then
+                ln -s /var/lib/snapd/snap /snap || log_message "warning" "Failed to create /snap symlink."
+            fi
+        fi
+        
+        sudo snap install core || log_message "warning" "Failed to install snap core."
+        sudo snap refresh core || log_message "warning" "Failed to refresh snap core."
+        sudo snap install --classic certbot || { log_message "error" "Failed to install Certbot via snapd."; return 1; }
+        
+        # Create symlink for certbot command if not already in PATH
+        if ! command -v certbot &>/dev/null; then
+            ln -s /snap/bin/certbot /usr/bin/certbot || log_message "warning" "Failed to create certbot symlink to /usr/bin. You might need to use /snap/bin/certbot directly."
+        fi
+        log_message "success" "Certbot installed via snapd."
+    else
+        log_message "info" "Certbot already installed. Skipping snapd installation."
+    fi
+
+    # Install Nginx (if not already present)
+    if ! command -v nginx &>/dev/null; then
+        log_message "info" "Installing Nginx..."
+        apt install nginx -y || { log_message "error" "Failed to install Nginx."; return 1; }
+        log_message "success" "Nginx installed."
+    else
+        log_message "info" "Nginx already installed."
+    fi
+
+    log_message "success" "Required dependencies (Nginx, Certbot) checked/installed."
 
     log_message "info" "Setting up Nginx cache directory..."
     mkdir -p /var/cache/nginx || { log_message "error" "Failed to create Nginx cache directory. Check permissions."; return 1; }
@@ -134,8 +170,14 @@ is_valid_domain() {
 is_valid_ip() {
     local ip="$1"
     # Basic regex for IPv4 validation
-    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] && \
-    $(echo "$ip" | awk -F'.' '{for (i=1;i<=4;i++) if ($i<0 || $i>255) exit 1; exit 0}')
+    if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        # Further check octet ranges
+        local IFS='.'
+        read -r o1 o2 o3 o4 <<< "$ip"
+        [[ "$o1" -le 255 && "$o2" -le 255 && "$o3" -le 255 && "$o4" -le 255 ]]
+    else
+        return 1 # Not a valid format
+    fi
 }
 
 
@@ -190,7 +232,7 @@ enable_nginx_config() {
     if [[ -f "$available_path" ]]; then
         if [[ -L "$enabled_path" ]]; then
             log_message "warning" "Nginx config for ${domain} already enabled. Updating symlink."
-            rm "$enabled_path" # Remove old symlink to create new one if target changed
+            rm -f "$enabled_path" # Remove old symlink to create new one if target changed
         fi
         ln -s "$available_path" "$enabled_path" || { log_message "error" "Failed to enable Nginx config for ${domain}. Check permissions."; return 1; }
         log_message "success" "Enabled Nginx config for ${domain}."
@@ -208,11 +250,11 @@ disable_nginx_config() {
     local available_path="${NGINX_SITES_AVAILABLE}/${domain}.conf"
 
     if [[ -L "$enabled_path" ]]; then
-        rm "$enabled_path" || { log_message "error" "Failed to remove Nginx enabled symlink for ${domain}."; }
+        rm -f "$enabled_path" || { log_message "error" "Failed to remove Nginx enabled symlink for ${domain}."; }
         log_message "info" "Disabled Nginx config symlink for ${domain}."
     fi
     if [[ -f "$available_path" ]]; then
-        rm "$available_path" || { log_message "error" "Failed to remove Nginx available config file for ${domain}."; }
+        rm -f "$available_path" || { log_message "error" "Failed to remove Nginx available config file for ${domain}."; }
         log_message "info" "Removed Nginx config file for ${domain}."
     fi
     return 0
@@ -222,10 +264,20 @@ disable_nginx_config() {
 apply_certbot() {
     local domain="$1"
     log_message "info" "Attempting to get SSL certificate for ${domain}..."
-    # --redirect automatically adds 301 redirects from HTTP to HTTPS
-    # --staple-ocsp enables OCSP stapling for faster SSL handshakes
-    # --hsts adds Strict-Transport-Security header (recommended for security)
-    certbot --nginx -d "${domain}" --non-interactive --agree-tos --email "${EMAIL_FOR_CERTBOT}" --redirect --hsts --staple-ocsp --no-reuse-existing-projects
+    
+    # Common Certbot flags
+    local certbot_flags="--nginx -d \"${domain}\" --non-interactive --agree-tos --email \"${EMAIL_FOR_CERTBOT}\" --redirect --hsts --staple-ocsp"
+    
+    # Check if Certbot supports the --no-reuse-existing-projects flag
+    # This is a robust way to handle older Certbot versions
+    if certbot --help deploy | grep -q -- "--no-reuse-existing-projects"; then
+        certbot_flags+=" --no-reuse-existing-projects"
+    else
+        log_message "warning" "Your Certbot version does not support --no-reuse-existing-projects. Proceeding without it."
+    fi
+
+    # Execute Certbot command
+    eval "certbot $certbot_flags"
     
     if [[ $? -ne 0 ]]; then
         log_message "warning" "Certbot failed for ${domain}. This could be due to DNS propagation issues, firewall, or existing certificates. Please verify your DNS A record (pointing THIS VPS IP) is public and port 80/443 are open."
@@ -244,7 +296,7 @@ add_domain() {
     clear
     log_message "info" "--- Add New Subdomain Tunnel ---"
     read -rp "Enter the subdomain (e.g., ops.example.com): " subdomain
-    subdomain=$(echo "$subdomain" | tr '[:upper:]' '[:lower:]') # Convert to lowercase
+    subdomain=$(echo "$subdomain" | tr '[:upper:]' '[:lower:]' | xargs) # Convert to lowercase and trim whitespace
 
     if [[ -z "$subdomain" ]]; then
         log_message "error" "Subdomain cannot be empty."
@@ -269,6 +321,7 @@ add_domain() {
     fi
 
     read -rp "Enter the main server IP for ${subdomain}: " ip_address
+    ip_address=$(echo "$ip_address" | xargs) # Trim whitespace
 
     if ! is_valid_ip "$ip_address"; then
         log_message "error" "Invalid IP address format. Please enter a valid IPv4 address (e.g., 192.168.1.1)."
@@ -281,7 +334,7 @@ add_domain() {
     save_domains
 
     # Ensure Nginx is running before generating config
-    systemctl is-active --quiet nginx || systemctl start nginx
+    systemctl is-active --quiet nginx || { log_message "info" "Nginx not active, attempting to start..."; systemctl start nginx || { log_message "error" "Failed to start Nginx. Check its status."; press_enter_to_continue; return; } }
 
     generate_nginx_config "$subdomain" "$ip_address" && \
     enable_nginx_config "$subdomain" && \
@@ -294,7 +347,7 @@ add_domain() {
         log_message "success" "Final Nginx reload for ${subdomain} with HTTPS."
     else
         log_message "warning" "HTTPS setup for ${subdomain} might be incomplete. Please check logs and Cloudflare DNS."
-    fi
+    _fi
 
     log_message "info" "--- IMPORTANT Cloudflare Steps ---"
     log_message "info" "1. In Cloudflare, if you have an existing record for '${subdomain}', ensure it's **proxied (orange cloud)** and points to your **main server's IP**."
@@ -407,8 +460,13 @@ remove_all() {
         log_message "success" "Script configuration removed."
 
         # Remove installed packages
-        log_message "info" "Removing Nginx, Certbot, and Python packages..."
-        apt purge -y nginx certbot python3-certbot-nginx &>/dev/null
+        log_message "info" "Attempting to remove Nginx and Certbot packages..."
+        # Prioritize snap removal for certbot
+        if command -v snap &>/dev/null && snap list | grep -q "certbot"; then
+            snap remove --purge certbot || log_message "warning" "Failed to purge Certbot snap package."
+        fi
+        # Remove apt packages
+        apt purge -y nginx certbot python3-certbot-nginx snapd &>/dev/null # Also try to purge snapd
         apt autoremove -y &>/dev/null
         log_message "success" "Dependencies purged."
         
@@ -464,22 +522,19 @@ check_root
 
 # This block determines if the script is being run for the first time via curl/wget
 # or if it's already installed locally and being run directly.
-if [[ "$(basename "$0")" == "$SCRIPT_NAME" || -z "$(grep -l "${SCRIPT_NAME}" "$0")" ]]; then
-    # This condition is tricky to make universally robust for self-execution.
-    # The simple check `if [[ "$(basename "$0")" == "$SCRIPT_NAME" ]]` will only be true
-    # if the script is called directly by its name (e.g., `iran_vps_tunnel_manager.sh`).
-    # If called via `bash -c "$(curl ...)"`, `basename "$0"` will be "bash".
-    #
-    # The primary goal is that the initial `curl | bash` downloads and then `exec`s itself.
-    # Once `exec`ed, it will run as `/usr/local/bin/iran_vps_tunnel_manager.sh` and then hit this `if` block.
-    #
-    # So, the logic here implies: If we are running the *installed* version of the script,
-    # or if this is the very first execution that is downloading itself,
-    # we need to proceed with dependency installation and the main menu loop.
+# The primary goal is that the initial `curl | bash` downloads and then `exec`s itself.
+# Once `exec`ed, it will run as `/usr/local/bin/iran_vps_tunnel_manager.sh` and then hit this `if` block.
+# So, the logic here implies: If we are running the *installed* version of the script,
+# we need to proceed with dependency installation and the main menu loop.
+# The `exec "$script_path"` in `self_download_and_run` transfers control to the
+# newly downloaded script, making `$(basename "$0")` equal to `SCRIPT_NAME` for the
+# *subsequent* run of the downloaded script.
 
+# Check if the script is being run as the installed version in /usr/local/bin
+if [[ "$(readlink -f "$0")" == "/usr/local/bin/${SCRIPT_NAME}" ]]; then
+    log_message "info" "Running installed script from /usr/local/bin/${SCRIPT_NAME}."
     load_domains || { log_message "error" "Failed to load domains. Exiting."; exit 1; }
-
-    # Only install dependencies and setup cron if they haven't been done
+    
     if install_dependencies; then
         # Set up certbot renewal only once if not already set
         if ! crontab -l 2>/dev/null | grep -q "certbot renew"; then
@@ -495,7 +550,30 @@ if [[ "$(basename "$0")" == "$SCRIPT_NAME" || -z "$(grep -l "${SCRIPT_NAME}" "$0
         exit 1
     fi
 else
-    # This branch is primarily for the *very first* execution via `curl | bash`
+    # This branch is for the *very first* execution via `curl | bash`
     # It handles the self-downloading process.
+    self_download_and_run() {
+        local script_path="/usr/local/bin/${SCRIPT_NAME}"
+        
+        log_message "info" "Script not found locally or initiating first-time download. Downloading ${SCRIPT_NAME} from GitHub..."
+        if command -v curl &>/dev/null; then
+            curl -sL "$GITHUB_RAW_URL" -o "$script_path"
+        elif command -v wget &>/dev/null; then
+            wget -qO "$script_path" "$GITHUB_RAW_URL"
+        else
+            log_message "error" "Neither curl nor wget found. Please install one to download the script (e.g., sudo apt install curl)."
+            exit 1
+        fi
+        
+        if [[ $? -ne 0 || ! -f "$script_path" ]]; then
+            log_message "error" "Failed to download ${SCRIPT_NAME} from GitHub. Check the URL and your network connection."
+            exit 1
+        fi
+        chmod +x "$script_path"
+        log_message "success" "${SCRIPT_NAME} downloaded to ${script_path} and made executable."
+        
+        log_message "info" "Re-executing the script from its permanent location..."
+        exec "$script_path" # Transfer control to the newly downloaded script
+    }
     self_download_and_run
 fi
